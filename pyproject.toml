@@ -1,18 +1,17 @@
 [project]
-name = "yolo26seg-skripsi"
-version = "0.2.0"
-description = "YOLO26s-seg nucleus segmentation trained on PanNuke"
+name = "cellpose-skripsi"
+version = "0.1.0"
+description = "Cellpose nucleus segmentation fine-tuned on PanNuke"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "ultralytics",
+    "cellpose",
     "datasets",
     "numpy",
-    "opencv-python-headless",
     "tifffile",
     "tqdm",
     "Pillow",
 ]
 
 [project.scripts]
-yolo26seg-skripsi = "main:main"
+cellpose-skripsi = "main:main"

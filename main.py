@@ -1,82 +1,51 @@
-"""CLI entry point for yolo26seg-skripsi."""
+"""CLI entry point for cellpose-skripsi."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from train import MODEL_BASEDIR, MODEL_NAMES
+from train import MODEL_NAME
 
-# Default to segmentation model path
-MODEL_PATH = (
-    Path("runs/segment")
-    / MODEL_BASEDIR
-    / MODEL_NAMES["segment"]
-    / "weights"
-    / "best.pt"
-)
+MODEL_PATH = Path.home() / ".cellpose" / "models" / (MODEL_NAME + ".pt")
 
 
 def cmd_train(args: argparse.Namespace) -> None:
-    from train import train
+    from train import train_model
 
-    train(
-        task=args.task,
-        use_classes=not args.no_classes,
-        max_samples=args.max_samples,
-    )
+    train_model(max_samples=args.max_samples)
 
 
 def cmd_predict(args: argparse.Namespace) -> None:
-    from predict import load_model, predict, summarize
+    from predict import predict, summarize
 
-    # Resolve model path based on task
     if args.model_path:
-        model_path = args.model_path
+        from cellpose import models
+
+        model = models.CellposeModel(gpu=True, pretrained_model=args.model_path)
     else:
-        runs_dir = Path("runs") / args.task
-        model_path = (
-            runs_dir / MODEL_BASEDIR / MODEL_NAMES[args.task] / "weights" / "best.pt"
-        )
+        model = None
 
-    model = load_model(model_path)
-    labels, details = predict(
-        args.image,
-        model=model,
-        conf=args.conf,
-        iou=args.iou,
-    )
-
-    summarize(labels, details)
+    masks, details = predict(args.image, model=model)
+    summarize(masks, details)
 
     if args.output:
         import numpy as np
         from tifffile import imwrite
 
-        imwrite(args.output, labels.astype(np.uint16))
+        imwrite(args.output, masks.astype(np.uint16))
         print(f"Saved → {args.output}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="yolo26seg-skripsi",
-        description="YOLO26 nucleus segmentation & detection on PanNuke",
+        prog="cellpose-skripsi",
+        description="Cellpose nucleus segmentation fine-tuned on PanNuke",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── train ──
-    t = sub.add_parser("train", help="Train YOLO26 on PanNuke (fold1+fold2 → fold3 val)")
-    t.add_argument(
-        "--task",
-        choices=["segment", "detect"],
-        default="segment",
-        help="Task: segment (polygon masks) or detect (bounding boxes)",
-    )
-    t.add_argument(
-        "--no-classes",
-        action="store_true",
-        help="Disable class-aware training",
-    )
+    t = sub.add_parser("train", help="Fine-tune Cellpose-SAM on PanNuke (fold1+fold2)")
 
     def _positive_int(v: str) -> int:
         n = int(v)
@@ -89,17 +58,14 @@ def main() -> None:
         type=_positive_int,
         default=None,
         metavar="N",
-        help="Cap samples per fold for quick tests (e.g. --max-samples 50)",
+        help="Cap samples per fold for quick tests (e.g. --max-samples 5)",
     )
 
     # ── predict ──
     p = sub.add_parser("predict", help="Run inference on a single image")
     p.add_argument("image", help="Path to input image")
     p.add_argument("--output", "-o", metavar="FILE", help="Save instance map as TIFF")
-    p.add_argument("--task", choices=["segment", "detect"], default="segment")
-    p.add_argument("--model-path", default=None, help="Path to trained .pt model")
-    p.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
-    p.add_argument("--iou", type=float, default=0.7, help="NMS IoU threshold")
+    p.add_argument("--model-path", default=None, help="Path to trained cellpose .pt model")
 
     args = parser.parse_args()
 

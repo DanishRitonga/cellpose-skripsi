@@ -14,22 +14,17 @@ source .venv/bin/activate
 ## Commands
 
 ```bash
-# Segmentation training (polygon masks) — default
+# Training — fine-tune Cellpose-SAM on PanNuke
 python main.py train
-python main.py train --max-samples 20          # quick smoke test
-python main.py train --no-classes              # single class "nucleus"
-
-# Detection training (bounding boxes)
-python main.py train --task detect
-python main.py train --task detect --max-samples 20
+python main.py train --max-samples 5          # quick smoke test
 
 # Inference
 python main.py predict path/to/image.png
-python main.py predict path/to/image.png --task detect -o output.tiff
+python main.py predict path/to/image.png -o output.tiff
 
 # Installed entry point (same as python main.py)
-yolo26seg-skripsi train
-yolo26seg-skripsi predict path/to/image.png
+cellpose-skripsi train
+cellpose-skripsi predict path/to/image.png
 ```
 
 There is no test suite.
@@ -40,51 +35,41 @@ Four files, no packages:
 
 | File | Role |
 |------|------|
-| `main.py` | argparse CLI router — delegates to `train.train()` or `predict.predict()` |
-| `data.py` | PanNuke loading, mask-to-polygon/bbox conversion, YOLO dataset on disk |
-| `train.py` | YOLO26s config and training for both `segment` and `detect` tasks |
-| `predict.py` | Single-image inference, mask/bbox-to-instance-map conversion |
+| `main.py` | argparse CLI router — delegates to `train.train_model()` or `predict.predict()` |
+| `data.py` | PanNuke loading, instance-mask-to-label-map conversion, .npy caching |
+| `train.py` | Cellpose CPSAM fine-tuning using `cellpose.train.train_seg()` |
+| `predict.py` | Single-image inference via `CellposeModel.eval()` |
 
 ### Data flow
 
-**PanNuke** (HuggingFace `RationAI/PanNuke`) has three folds. `prepare_yolo_dataset` in `data.py`:
+**PanNuke** (HuggingFace `RationAI/PanNuke`) has three folds. `prepare_dataset` in `data.py`:
 
-1. **First run** — streams folds from HuggingFace one sample at a time (`streaming=True`), writes images as PNG and **both** label formats (polygons + bboxes) in a single pass.
-2. **Subsequent runs** — skips folds whose image directories already exist.
+1. **First run** — streams folds from HuggingFace (`streaming=True`), converts instance masks to integer label maps, caches as `.npy` files.
+2. **Subsequent runs** — loads cached `.npy` files from disk.
+
+Returns `(train_imgs, train_lbls, val_imgs, val_lbls)` — four lists of numpy arrays passed directly to cellpose's `train_seg()`.
 
 ### Data directory layout
 
 ```
-data/pannuke_yolo/
-  images/train/*.png          (actual images, fold1)
-  images/val/*.png            (fold2)
-  images/test/*.png           (fold3)
-  images/det_train/           (symlinks → ../train/)
-  images/det_val/             (symlinks → ../val/)
-  images/det_test/            (symlinks → ../test/)
-  labels/train/*.txt          (segmentation: class_id x1 y1 ... xn yn)
-  labels/val/*.txt
-  labels/test/*.txt
-  labels/det_train/*.txt      (detection: class_id cx cy w h)
-  labels/det_val/*.txt
-  labels/det_test/*.txt
-  dataset.yaml                (segmentation config)
-  dataset_det.yaml            (detection config)
+data/pannuke/
+  train/              (fold1)
+    000000.npy        (image, uint8, shape 256×256×3)
+    000000_label.npy  (label map, int32, shape 256×256)
+    ...
+  val/                (fold2)
+  test/               (fold3)
 ```
 
-Detection images live at `images/det_{split}/` (symlinks to `images/{split}/`) and detection labels at `labels/det_{split}/`. This is required because Ultralytics resolves label paths by replacing the exact substring `/images/` with `/labels/` in the image path. The nested `det_` prefix ensures the replacement works: `images/det_train/` → `labels/det_train/`.
+### Training
 
-### Tasks
-
-| `--task` | Model | Label format | Output |
-|----------|-------|-------------|--------|
-| `segment` | `yolo26s-seg.pt` | Polygons | Instance masks |
-| `detect` | `yolo26s.pt` | Bounding boxes | Bboxes + centres |
+- Starts from pretrained **CPSAM** weights (downloaded automatically by cellpose).
+- Uses `cellpose.train.train_seg()` with: `n_epochs=100`, `lr=1e-5`, `weight_decay=0.1`, `batch_size=1`.
+- Model saved to `~/.cellpose/models/cellpose_pannuke.pt` (cellpose's default location).
 
 ### Key details
 
-- `CELL_TYPES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]` — 5 PanNuke classes, 0-indexed in label files.
-- `--no-classes` sets all instances to class 0 and uses a single `nucleus` class name.
-- Ultralytics early-stops by default (patience=100). Best model is always saved regardless.
-- Model output paths: `runs/{segment|detect}/models/pannuke_yolo26{seg|det}/weights/best.pt`
-- `predict.py` converts polygon masks to instance label maps; for detection models it marks bbox centres on the label map.
+- Cellpose is **instance-only** segmentation — no multi-class support. All nuclei are treated equally regardless of cell type.
+- `CELL_TYPES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]` — defined for reference but not used in training.
+- `--max-samples` caps samples per fold for quick smoke tests.
+- `predict.py` outputs an integer label map where `0 = background`, `1, 2, ... = instance IDs`.
