@@ -47,11 +47,12 @@ def _process_fold(
     fold_name: str,
     split: str,
     max_samples: int | None,
-) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Stream one PanNuke fold, cache to disk, and return (images, labels).
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Stream one PanNuke fold, cache to disk, and return (images, labels, categories).
 
     Images are saved as uint8 .npy (H, W, 3).
     Labels are saved as int32 .npy (H, W) label maps.
+    Categories are saved as int32 .npy (N_instances,) per-instance cell-type indices.
     """
     split_dir = DATA_DIR / split
     split_dir.mkdir(parents=True, exist_ok=True)
@@ -62,6 +63,7 @@ def _process_fold(
 
     images: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    categories: list[np.ndarray] = []
 
     i = -1
     for i, sample in enumerate(tqdm(ds, desc=fold_name, unit="img")):
@@ -70,13 +72,16 @@ def _process_fold(
         img_np = np.array(img, dtype=np.uint8)  # (H, W, 3)
 
         labelmap = _instances_to_labelmap(sample["instances"], img_h, img_w)
+        cat_arr = np.array(sample["categories"], dtype=np.int32)
 
         # Cache to disk
         np.save(split_dir / f"{i:06d}.npy", img_np)
         np.save(split_dir / f"{i:06d}_label.npy", labelmap)
+        np.save(split_dir / f"{i:06d}_categories.npy", cat_arr)
 
         images.append(img_np)
         labels.append(labelmap)
+        categories.append(cat_arr)
 
         if i % 100 == 0:
             gc.collect()
@@ -85,21 +90,24 @@ def _process_fold(
     n_instances = sum(int(l.max()) for l in labels) if labels else 0
     print(f"  {fold_name} → {split}: {n_images} images, {n_instances} instances")
 
-    return images, labels
+    return images, labels, categories
 
 
-def _load_cached_split(split_dir: Path) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Load cached images and label maps from a split directory."""
+def _load_cached_split(split_dir: Path) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Load cached images, label maps, and categories from a split directory."""
     img_files = sorted(split_dir.glob("[0-9]*.npy"))
     images = []
     labels = []
+    categories = []
     for img_path in tqdm(img_files, desc=f"Loading {split_dir.name}", unit="img"):
         label_path = split_dir / (img_path.stem + "_label.npy")
+        cat_path = split_dir / (img_path.stem + "_categories.npy")
         if not label_path.exists():
             continue
         images.append(np.load(img_path))
         labels.append(np.load(label_path))
-    return images, labels
+        categories.append(np.load(cat_path) if cat_path.exists() else np.array([], dtype=np.int32))
+    return images, labels, categories
 
 
 def prepare_dataset(
@@ -114,7 +122,7 @@ def prepare_dataset(
         (train_images, train_labels, val_images, val_labels)
         Each is a list of numpy arrays.
     """
-    all_data: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {}
+    all_data: dict[str, tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]] = {}
 
     for fold, split in FOLD_TO_SPLIT.items():
         split_dir = DATA_DIR / split
@@ -127,8 +135,8 @@ def prepare_dataset(
                 shutil.rmtree(split_dir)
             all_data[split] = _process_fold(fold, split, max_samples)
 
-    train_imgs, train_lbls = all_data["train"]
-    val_imgs, val_lbls = all_data["val"]
+    train_imgs, train_lbls, _ = all_data["train"]
+    val_imgs, val_lbls, _ = all_data["val"]
 
     print(f"\nDataset ready: {len(train_imgs)} train, {len(val_imgs)} val")
     return train_imgs, train_lbls, val_imgs, val_lbls

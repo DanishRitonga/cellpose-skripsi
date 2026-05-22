@@ -37,6 +37,12 @@ def cmd_predict(args: argparse.Namespace) -> None:
         print(f"Saved → {args.output}")
 
 
+def cmd_evaluate(args: argparse.Namespace) -> None:
+    from evaluate import evaluate
+
+    evaluate(max_samples=args.max_samples, model_path=args.model_path)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cellpose-skripsi",
@@ -67,12 +73,19 @@ def main() -> None:
     p.add_argument("--output", "-o", metavar="FILE", help="Save instance map as TIFF")
     p.add_argument("--model-path", default=None, help="Path to trained cellpose .pt model")
 
+    # ── evaluate ──
+    e = sub.add_parser("evaluate", help="Evaluate on PanNuke fold3 (mPQ / bPQ)")
+    e.add_argument("--max-samples", type=_positive_int, default=None, metavar="N", help="Cap test samples")
+    e.add_argument("--model-path", default=None, help="Path to trained cellpose .pt model")
+
     args = parser.parse_args()
 
     if args.command == "train":
         cmd_train(args)
     elif args.command == "predict":
         cmd_predict(args)
+    elif args.command == "evaluate":
+        cmd_evaluate(args)
 
 
 if __name__ == "__main__":
