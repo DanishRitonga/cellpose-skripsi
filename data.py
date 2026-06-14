@@ -1,4 +1,4 @@
-"""PanNuke dataset loading and label-map conversion for Cellpose training."""
+"""PanNuke dataset loading and label-map conversion for Classpose training."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from tqdm import tqdm
 DATASET_ID = "RationAI/PanNuke"
 DATA_DIR = Path("data") / "pannuke"
 
-# PanNuke cell-type classes (0-indexed, matching `categories` field values)
 CELL_TYPES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
 
 FOLD_TO_SPLIT = {"fold1": "train", "fold2": "val", "fold3": "test"}
@@ -36,6 +35,29 @@ def _instances_to_labelmap(instances: list, img_h: int, img_w: int) -> np.ndarra
     return labelmap
 
 
+def _build_class_map(
+    labelmap: np.ndarray,
+    categories: list[int],
+) -> np.ndarray:
+    """Build a per-pixel class map from instance label map and per-instance categories.
+
+    Args:
+        labelmap: (H, W) int32 instance label map (0=bg, 1,2,...=instances).
+        categories: List of cell-type indices (0-indexed), one per instance,
+                    in the same order as instance IDs (1, 2, ...).
+
+    Returns:
+        (H, W) int32 class map where 0=background, 1..5=cell types
+        (PanNuke categories are 0-indexed, so we add 1 to shift to 1-indexed).
+    """
+    class_map = np.zeros_like(labelmap)
+    for inst_id in range(1, labelmap.max() + 1):
+        cat_idx = inst_id - 1
+        if cat_idx < len(categories):
+            class_map[labelmap == inst_id] = int(categories[cat_idx]) + 1
+    return class_map
+
+
 def _split_has_data(split_dir: Path) -> bool:
     """Check whether a split directory already contains cached .npy files."""
     if not split_dir.exists():
@@ -51,7 +73,7 @@ def _process_fold(
     """Stream one PanNuke fold, cache to disk, and return (images, labels, categories).
 
     Images are saved as uint8 .npy (H, W, 3).
-    Labels are saved as int32 .npy (H, W) label maps.
+    Labels are saved as int32 .npy (H, W, 2) — channels: [instance, class].
     Categories are saved as int32 .npy (N_instances,) per-instance cell-type indices.
     """
     split_dir = DATA_DIR / split
@@ -69,39 +91,42 @@ def _process_fold(
     for i, sample in enumerate(tqdm(ds, desc=fold_name, unit="img")):
         img: Image.Image = sample["image"]
         img_w, img_h = img.size
-        img_np = np.array(img, dtype=np.uint8)  # (H, W, 3)
+        img_np = np.array(img, dtype=np.uint8)
 
         labelmap = _instances_to_labelmap(sample["instances"], img_h, img_w)
         cat_arr = np.array(sample["categories"], dtype=np.int32)
+        class_map = _build_class_map(labelmap, sample["categories"])
 
-        # Cache to disk
+        label_2ch = np.stack([labelmap, class_map], axis=-1).astype(np.int32)
+
         np.save(split_dir / f"{i:06d}.npy", img_np)
-        np.save(split_dir / f"{i:06d}_label.npy", labelmap)
+        np.save(split_dir / f"{i:06d}_label.npy", label_2ch)
         np.save(split_dir / f"{i:06d}_categories.npy", cat_arr)
 
         images.append(img_np)
-        labels.append(labelmap)
+        labels.append(label_2ch)
         categories.append(cat_arr)
 
         if i % 100 == 0:
             gc.collect()
 
     n_images = i + 1 if i >= 0 else 0
-    n_instances = sum(int(l.max()) for l in labels) if labels else 0
+    n_instances = sum(int(l[..., 0].max()) for l in labels) if labels else 0
     print(f"  {fold_name} → {split}: {n_images} images, {n_instances} instances")
 
     return images, labels, categories
 
 
 def _load_cached_split(split_dir: Path) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
-    """Load cached images, label maps, and categories from a split directory."""
+    """Load cached images, 2-channel labels, and categories from a split directory."""
     img_files = sorted(split_dir.glob("[0-9]*.npy"))
     images = []
     labels = []
     categories = []
     for img_path in tqdm(img_files, desc=f"Loading {split_dir.name}", unit="img"):
-        label_path = split_dir / (img_path.stem + "_label.npy")
-        cat_path = split_dir / (img_path.stem + "_categories.npy")
+        stem = img_path.stem
+        label_path = split_dir / (stem + "_label.npy")
+        cat_path = split_dir / (stem + "_categories.npy")
         if not label_path.exists():
             continue
         images.append(np.load(img_path))
@@ -114,13 +139,14 @@ def prepare_dataset(
     max_samples: int | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """
-    Prepare the PanNuke dataset for Cellpose training.
+    Prepare the PanNuke dataset for Classpose training.
 
     fold1 → train, fold2 → val, fold3 → test
 
     Returns:
         (train_images, train_labels, val_images, val_labels)
-        Each is a list of numpy arrays.
+        Images: list of (H, W, 3) uint8 arrays.
+        Labels: list of (H, W, 2) int32 arrays — [instance, class].
     """
     all_data: dict[str, tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]] = {}
 
