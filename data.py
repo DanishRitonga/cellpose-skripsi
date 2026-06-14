@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import json
 import shutil
 from pathlib import Path
 
@@ -15,6 +16,11 @@ DATASET_ID = "RationAI/PanNuke"
 DATA_DIR = Path("data") / "pannuke"
 
 CELL_TYPES = ["Neoplastic", "Inflammatory", "Connective", "Dead", "Epithelial"]
+TISSUE_TYPES = [
+    "Adrenal", "BileDuct", "Bladder", "Breast", "Cervix", "Colorectal",
+    "Esophagus", "Head&Neck", "Kidney", "Liver", "Lung", "Ovarian",
+    "Pancreatic", "Prostate", "Skin", "Stomach", "Testis", "Thyroid", "Uterus",
+]
 
 FOLD_TO_SPLIT = {"fold1": "train", "fold2": "val", "fold3": "test"}
 
@@ -61,6 +67,7 @@ def _process_fold(
 
     images: list[np.ndarray] = []
     labels: list[np.ndarray] = []
+    metadata: list[dict] = []
 
     i = -1
     for i, sample in enumerate(tqdm(ds, desc=fold_name, unit="img")):
@@ -76,8 +83,15 @@ def _process_fold(
         images.append(img_np)
         labels.append(labelmap)
 
+        tissue = sample.get("tissue", -1)
+        categories = sample.get("categories", [])
+        metadata.append({"tissue": int(tissue), "categories": [int(c) for c in categories]})
+
         if i % 100 == 0:
             gc.collect()
+
+    with open(split_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f)
 
     n_images = i + 1 if i >= 0 else 0
     n_instances = sum(int(l.max()) for l in labels) if labels else 0
@@ -98,6 +112,18 @@ def _load_cached_split(split_dir: Path) -> tuple[list[np.ndarray], list[np.ndarr
         images.append(np.load(img_path))
         labels.append(np.load(label_path))
     return images, labels
+
+
+def load_metadata(split: str = "test") -> list[dict]:
+    """Load per-image metadata (tissue type and per-instance categories).
+
+    Returns list of dicts with keys 'tissue' (int) and 'categories' (list[int]).
+    """
+    meta_path = DATA_DIR / split / "metadata.json"
+    if not meta_path.exists():
+        return []
+    with open(meta_path) as f:
+        return json.load(f)
 
 
 def prepare_dataset(

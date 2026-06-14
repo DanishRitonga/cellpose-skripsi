@@ -25,7 +25,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
-from data import DATA_DIR, CELL_TYPES
+from data import DATA_DIR, CELL_TYPES, TISSUE_TYPES, load_metadata
 from train import MODEL_NAME
 
 MODEL_PATH = Path.home() / ".cellpose" / "models" / (MODEL_NAME + ".pt")
@@ -201,6 +201,11 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
         t: {"tp": [], "fp": [], "conf": [], "n_gt": 0} for t in IOU_THRESHOLDS
     }
 
+    n_tissues = len(TISSUE_TYPES)
+    tissue_aji: dict[int, list[float]] = {t: [] for t in range(n_tissues)}
+    tissue_bpq: dict[int, list[float]] = {t: [] for t in range(n_tissues)}
+    tissue_bmpq: dict[int, list[float]] = {t: [] for t in range(n_tissues)}
+
     n_total = len(image_results)
     for i, r in enumerate(image_results):
         gt_masks = r["gt_masks"]
@@ -209,6 +214,7 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
         gt_centroids = r["gt_centroids"]
         pred_centroids = r["pred_centroids"]
         im_h, im_w = r["imgsz"]
+        tissue = int(r.get("tissue", -1))
 
         if i == 0:
             print(
@@ -217,9 +223,9 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
                 flush=True,
             )
 
-        aji_scores.append(compute_aji(pred_masks, gt_masks))
+        aji_val = compute_aji(pred_masks, gt_masks)
+        aji_scores.append(aji_val)
 
-        # bPQ / bMPQ
         pred_binary = (
             np.stack(pred_masks).max(axis=0).astype(np.uint8)
             if pred_masks
@@ -241,7 +247,11 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
             bmpq = 0.0
         bmpq_scores.append(bmpq)
 
-        # AP — single-class, Hungarian matching
+        if 0 <= tissue < n_tissues:
+            tissue_aji[tissue].append(aji_val)
+            tissue_bpq[tissue].append(bpq)
+            tissue_bmpq[tissue].append(bmpq)
+
         n_pred = len(pred_masks)
         n_gt = len(gt_masks)
 
@@ -267,7 +277,6 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
                 ap_stats[t]["tp"].append(is_tp)
                 ap_stats[t]["fp"].append(not is_tp)
 
-        # Centroid F1
         if n_pred > 0 and n_gt > 0:
             dist_matrix = np.linalg.norm(
                 pred_centroids[:, None, :] - gt_centroids[None, :, :], axis=2
@@ -290,7 +299,6 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
                 flush=True,
             )
 
-    # Aggregate
     mean_aji = float(np.mean(aji_scores)) if aji_scores else 0.0
     mean_bpq = float(np.mean(bpq_scores)) if bpq_scores else 0.0
     mean_bmpq = float(np.mean(bmpq_scores)) if bmpq_scores else 0.0
@@ -333,15 +341,136 @@ def compute_metrics_streaming(image_results: list[dict]) -> dict:
         "bmpq": mean_bmpq,
         "ap": ap_results,
         "centroid": {"precision": prec, "recall": rec, "f1": f1},
+        "tissue_aji": tissue_aji,
+        "tissue_bpq": tissue_bpq,
+        "tissue_bmpq": tissue_bmpq,
     }
 
 
+def _per_tissue_breakdown(image_results: list[dict], metrics: dict) -> None:
+    """Per-tissue centroid F1 + AJI/bPQ/bMPQ."""
+    n_tissues = len(TISSUE_TYPES)
+    tp = [0] * n_tissues
+    fp = [0] * n_tissues
+    fn = [0] * n_tissues
+    n_imgs = [set() for _ in range(n_tissues)]
+
+    for ri, r in enumerate(image_results):
+        t = int(r.get("tissue", -1))
+        if t < 0 or t >= n_tissues:
+            continue
+        n_imgs[t].add(ri)
+
+        gt_centroids = r["gt_centroids"]
+        pred_centroids = r["pred_centroids"]
+        n_gt = len(gt_centroids)
+        n_pred = len(pred_centroids)
+
+        if n_gt == 0:
+            fp[t] += n_pred
+            continue
+        if n_pred == 0:
+            fn[t] += n_gt
+            continue
+
+        dist = np.linalg.norm(
+            gt_centroids[:, None, :] - pred_centroids[None, :, :], axis=2
+        )
+        row_ind, col_ind = linear_sum_assignment(dist)
+        matched = int((dist[row_ind, col_ind] <= CENTROID_RADIUS).sum())
+        tp[t] += matched
+        fp[t] += n_pred - matched
+        fn[t] += n_gt - matched
+
+    t_aji = metrics.get("tissue_aji", {})
+    t_bpq = metrics.get("tissue_bpq", {})
+    t_bmpq = metrics.get("tissue_bmpq", {})
+
+    print(f"\n{'=' * 85}")
+    print(f"  Tissue Type Breakdown")
+    print(f"{'=' * 85}")
+    hdr = f"  {'Tissue':<14} {'Imgs':>5} {'Prec':>7} {'Recall':>7} {'F1':>7} {'AJI':>7} {'bPQ':>7} {'bMPQ':>7}"
+    sep = f"  {'-' * 14} {'-' * 5} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 7} {'-' * 7}"
+    fmt = f"  {{name:<14}} {{ni:>5}} {{prec:>7.4f}} {{rec:>7.4f}} {{f1:>7.4f}} {{aji:>7.4f}} {{bpq:>7.4f}} {{bmpq:>7.4f}}"
+    print(hdr)
+    print(sep)
+
+    has_tissue = False
+    for t in range(n_tissues):
+        if not n_imgs[t]:
+            continue
+        has_tissue = True
+        prec = tp[t] / (tp[t] + fp[t]) if (tp[t] + fp[t]) else 0
+        rec = tp[t] / (tp[t] + fn[t]) if (tp[t] + fn[t]) else 0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0
+
+        aji_arr = t_aji.get(t, [])
+        bpq_arr = t_bpq.get(t, [])
+        bmpq_arr = t_bmpq.get(t, [])
+        aji_m = float(np.mean(aji_arr)) if aji_arr else 0.0
+        bpq_m = float(np.mean(bpq_arr)) if bpq_arr else 0.0
+        bmpq_m = float(np.mean(bmpq_arr)) if bmpq_arr else 0.0
+
+        print(
+            fmt.format(
+                name=TISSUE_TYPES[t],
+                ni=len(n_imgs[t]),
+                prec=prec,
+                rec=rec,
+                f1=f1,
+                aji=aji_m,
+                bpq=bpq_m,
+                bmpq=bmpq_m,
+            )
+        )
+
+    if not has_tissue:
+        print("  (no tissue metadata — re-download PanNuke to populate)")
+        print(f"{'=' * 85}")
+        return
+
+    tot_tp = sum(tp)
+    tot_fp = sum(fp)
+    tot_fn = sum(fn)
+    p_t = tot_tp / (tot_tp + tot_fp) if (tot_tp + tot_fp) else 0
+    r_t = tot_tp / (tot_tp + tot_fn) if (tot_tp + tot_fn) else 0
+    f_t = 2 * p_t * r_t / (p_t + r_t) if (p_t + r_t) else 0
+    print(
+        fmt.format(
+            name="TOTAL",
+            ni=len(image_results),
+            prec=p_t,
+            rec=r_t,
+            f1=f_t,
+            aji=metrics["aji"],
+            bpq=metrics["bpq"],
+            bmpq=metrics["bmpq"],
+        )
+    )
+
+    per_t_aji = [float(np.mean(t_aji.get(t))) for t in range(n_tissues) if t_aji.get(t)]
+    per_t_bpq = [float(np.mean(t_bpq.get(t))) for t in range(n_tissues) if t_bpq.get(t)]
+    per_t_bmpq = [float(np.mean(t_bmpq.get(t))) for t in range(n_tissues) if t_bmpq.get(t)]
+    am = float(np.mean(per_t_aji)) if per_t_aji else 0.0
+    as_ = float(np.std(per_t_aji)) if len(per_t_aji) > 1 else 0.0
+    bm = float(np.mean(per_t_bpq)) if per_t_bpq else 0.0
+    bs = float(np.std(per_t_bpq)) if len(per_t_bpq) > 1 else 0.0
+    mm = float(np.mean(per_t_bmpq)) if per_t_bmpq else 0.0
+    ms = float(np.std(per_t_bmpq)) if len(per_t_bmpq) > 1 else 0.0
+    print(f"  {'Avg':<14} {'':>5} {'':>7} {'':>7} {'':>7} {am:>7.4f} {bm:>7.4f} {mm:>7.4f}")
+    print(f"  {'Std':<14} {'':>5} {'':>7} {'':>7} {'':>7} {as_:>7.4f} {bs:>7.4f} {ms:>7.4f}")
+    print(f"{'=' * 85}")
+
+
 def _diagnose_recall(image_results: list[dict]) -> None:
-    """Break down recall by GT size bin and nearest-prediction distance."""
+    """Break down recall by GT size bin, class, and nearest-prediction distance."""
     gt_areas_matched: list[float] = []
     gt_areas_unmatched: list[float] = []
     unmatched_dists: list[float] = []
     unmatched_nearest_conf: list[float] = []
+
+    class_total = [0] * len(CELL_TYPES)
+    class_matched = [0] * len(CELL_TYPES)
 
     for r in image_results:
         gt_masks = r["gt_masks"]
@@ -356,6 +485,7 @@ def _diagnose_recall(image_results: list[dict]) -> None:
             continue
 
         gt_areas = np.array([m.sum() for m in gt_masks], dtype=np.float64)
+        gt_cats = r.get("gt_categories", [])
 
         if n_pred > 0:
             dist_matrix = np.linalg.norm(
@@ -382,6 +512,13 @@ def _diagnose_recall(image_results: list[dict]) -> None:
                 else:
                     unmatched_dists.append(float("inf"))
                     unmatched_nearest_conf.append(0.0)
+
+            if j < len(gt_cats):
+                cls_id = int(gt_cats[j])
+                if 0 <= cls_id < len(CELL_TYPES):
+                    class_total[cls_id] += 1
+                    if matched[j]:
+                        class_matched[cls_id] += 1
 
     total_gt = len(gt_areas_matched) + len(gt_areas_unmatched)
     total_matched = len(gt_areas_matched)
@@ -417,6 +554,15 @@ def _diagnose_recall(image_results: list[dict]) -> None:
                 rng = "-"
             rec_b = m / t if t > 0 else 0.0
             print(f"  {label:<20} {rng:<18} {t:>8} {m:>8} {rec_b:>8.4f}")
+
+    # Per-class recall
+    if any(class_total):
+        print(f"\n  {'Nuclei Class':<18} {'Total':>8} {'Matched':>8} {'Recall':>8}")
+        print(f"  {'-' * 18} {'-' * 8} {'-' * 8} {'-' * 8}")
+        for c in range(len(CELL_TYPES)):
+            if class_total[c] > 0:
+                r = class_matched[c] / class_total[c]
+                print(f"  {CELL_TYPES[c]:<18} {class_total[c]:>8} {class_matched[c]:>8} {r:>8.4f}")
 
     # Unmatched GT distance breakdown
     if unmatched_dists:
@@ -468,6 +614,9 @@ def evaluate(
     """Run evaluation on PanNuke fold3 — LSP-DETR protocol (binary)."""
     print("Loading PanNuke fold3 (test) ...")
     images, gt_labels = _load_test_split(max_samples)
+    metadata = load_metadata("test")
+    if len(metadata) != len(images):
+        metadata = [{}] * len(images)
     print(f"  {len(images)} test images loaded.")
 
     print("Loading Cellpose model ...")
@@ -482,6 +631,7 @@ def evaluate(
     for idx in tqdm(range(len(images)), desc="Inference", unit="img"):
         img = images[idx]
         gt_label = gt_labels[idx]
+        meta = metadata[idx] if idx < len(metadata) else {}
 
         pred_masks_arr, flows, _ = cpmodel.eval(img)
         im_h, im_w = img.shape[:2]
@@ -499,6 +649,8 @@ def evaluate(
                 "pred_centroids": pred_centroids,
                 "gt_centroids": gt_centroids,
                 "imgsz": (im_h, im_w),
+                "tissue": meta.get("tissue", -1),
+                "gt_categories": meta.get("categories", []),
             }
         )
 
@@ -539,6 +691,7 @@ def evaluate(
     print(f"  {'Inference (ms/img)':<30} {t_inf / len(images) * 1000:>12.1f}")
     print(f"{'=' * 60}")
 
+    _per_tissue_breakdown(image_results, mtx)
     _diagnose_recall(image_results)
 
     return {
