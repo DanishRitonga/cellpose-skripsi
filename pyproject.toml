@@ -1,11 +1,11 @@
 [project]
 name = "cellpose-skripsi"
-version = "0.2.0"
-description = "Classpose nucleus segmentation and classification fine-tuned on PanNuke"
+version = "0.1.0"
+description = "Cellpose nucleus segmentation fine-tuned on PanNuke"
 readme = "README.md"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.12,<3.13"
 dependencies = [
-    "classpose @ file:///tmp/opencode/classpose-fixed",
+    "cellpose",
     "datasets",
     "numpy",
     "scipy",
