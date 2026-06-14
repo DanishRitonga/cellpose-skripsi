@@ -64,9 +64,10 @@ def _extract_instances(
     confs = []
 
     if flows is not None:
+        flow_arr = flows[0] if isinstance(flows, list) else flows
         flow_mag = np.sqrt(
-            flows[..., 0].astype(np.float64) ** 2
-            + flows[..., 1].astype(np.float64) ** 2
+            flow_arr[..., 0].astype(np.float64) ** 2
+            + flow_arr[..., 1].astype(np.float64) ** 2
         )
 
     for inst_id in instance_ids:
